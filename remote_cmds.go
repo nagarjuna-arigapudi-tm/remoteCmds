@@ -2,11 +2,14 @@ package remoteCmds
 
 import (
 	"bytes"
+	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +17,55 @@ import (
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
+
+// Global cluster list - equivalent to Python clusterList
+var ClusterList = []string{
+	"prod-cluster-01",
+	"prod-cluster-02",
+	"dev-cluster-01",
+	"staging-cluster-01",
+	"test-cluster-01",
+	"backup-cluster-01",
+}
+
+// HostData represents a single host entry in a cluster
+type HostData struct {
+	HostName string `json:"hostName"`
+	Type     string `json:"type"`
+	Count    int    `json:"count"`
+}
+
+// ClusterData represents the processed cluster data
+type ClusterData map[string][]HostData
+
+// CSVRecord represents a row from the master.csv file
+type CSVRecord struct {
+	Hostname    string
+	Type        string
+	Count       string
+	ClusterName string
+}
+
+// ClusterProcessor handles cluster data processing operations
+type ClusterProcessor struct {
+	ClusterList []string
+	Data        ClusterData
+	SSHConfig   *ssh.ClientConfig
+}
+
+// NewClusterProcessor creates a new cluster processor instance
+func NewClusterProcessor(sshKeyPath, username string) (*ClusterProcessor, error) {
+	sshConfig, err := NewSSHConfig(sshKeyPath, username)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create SSH config: %v", err)
+	}
+
+	return &ClusterProcessor{
+		ClusterList: ClusterList,
+		Data:        make(ClusterData),
+		SSHConfig:   sshConfig,
+	}, nil
+}
 
 // Result represents the outcome of command execution on a remote host
 type Result struct {
@@ -1504,4 +1556,396 @@ func GenerateCertificateReport(hostCertPairs map[string]string, sshConfig *ssh.C
 	report["hosts"] = hostReports
 
 	return report, nil
+}
+
+// ReadCSVAndProcess reads master.csv file and creates dictionaries for each cluster in ClusterList
+// Equivalent to Python's read_csv_and_process function
+func (cp *ClusterProcessor) ReadCSVAndProcess(csvFilePath string) error {
+	// Initialize result dictionary with empty lists for each cluster
+	cp.Data = make(ClusterData)
+	for _, cluster := range cp.ClusterList {
+		cp.Data[strings.ToLower(cluster)] = make([]HostData, 0)
+	}
+
+	// Check if CSV file exists
+	if _, err := os.Stat(csvFilePath); os.IsNotExist(err) {
+		return fmt.Errorf("CSV file '%s' not found", csvFilePath)
+	}
+
+	file, err := os.Open(csvFilePath)
+	if err != nil {
+		return fmt.Errorf("could not open file '%s': %v", csvFilePath, err)
+	}
+	defer file.Close()
+
+	reader := csv.NewReader(file)
+
+	// Read header
+	header, err := reader.Read()
+	if err != nil {
+		return fmt.Errorf("error reading CSV header: %v", err)
+	}
+
+	// Verify required columns exist
+	requiredColumns := []string{"Hostname", "Type", "#", "Cluster Name"}
+	columnIndices := make(map[string]int)
+
+	for i, col := range header {
+		columnIndices[col] = i
+	}
+
+	for _, reqCol := range requiredColumns {
+		if _, exists := columnIndices[reqCol]; !exists {
+			return fmt.Errorf("missing required column: %s", reqCol)
+		}
+	}
+
+	// Process each row in the CSV
+	rowCount := 0
+	matchedCount := 0
+
+	for {
+		row, err := reader.Read()
+		if err != nil {
+			if err.Error() == "EOF" {
+				break
+			}
+			return fmt.Errorf("error reading CSV row: %v", err)
+		}
+
+		rowCount++
+
+		if len(row) <= columnIndices["Cluster Name"] {
+			continue
+		}
+
+		clusterName := strings.TrimSpace(row[columnIndices["Cluster Name"]])
+		if clusterName == "" {
+			continue
+		}
+
+		// Check if cluster name matches any item in ClusterList (case insensitive)
+		for _, cluster := range cp.ClusterList {
+			if strings.EqualFold(clusterName, cluster) {
+				// Convert count to integer
+				countStr := strings.TrimSpace(row[columnIndices["#"]])
+				count, err := strconv.Atoi(countStr)
+				if err != nil {
+					count = 0 // Default to 0 if conversion fails
+				}
+
+				// Create host data
+				hostData := HostData{
+					HostName: strings.TrimSpace(row[columnIndices["Hostname"]]),
+					Type:     strings.TrimSpace(row[columnIndices["Type"]]),
+					Count:    count,
+				}
+
+				// Append to corresponding cluster list
+				cp.Data[strings.ToLower(cluster)] = append(cp.Data[strings.ToLower(cluster)], hostData)
+				matchedCount++
+				break
+			}
+		}
+	}
+
+	log.Printf("Processed %d rows from CSV file", rowCount)
+	log.Printf("Found %d matching entries for clusters in ClusterList", matchedCount)
+
+	return nil
+}
+
+// PrintClusterSummary prints a summary of the processed cluster data
+// Equivalent to Python's print_cluster_summary function
+func (cp *ClusterProcessor) PrintClusterSummary() {
+	fmt.Println("\n" + strings.Repeat("=", 60))
+	fmt.Println("CLUSTER DATA SUMMARY")
+	fmt.Println(strings.Repeat("=", 60))
+
+	for clusterName, hosts := range cp.Data {
+		// Find original cluster name from ClusterList (preserve case)
+		originalName := clusterName
+		for _, c := range cp.ClusterList {
+			if strings.ToLower(c) == clusterName {
+				originalName = c
+				break
+			}
+		}
+
+		fmt.Printf("\nCluster: %s\n", originalName)
+		fmt.Printf("Number of hosts: %d\n", len(hosts))
+
+		if len(hosts) > 0 {
+			fmt.Println("Hosts:")
+			for i, host := range hosts {
+				fmt.Printf("  %d. Hostname: %s, Type: %s, Count: %d\n",
+					i+1, host.HostName, host.Type, host.Count)
+			}
+		} else {
+			fmt.Println("  No matching hosts found.")
+		}
+	}
+}
+
+// SaveResultsToJSON saves the processed cluster data to a JSON file
+// Equivalent to Python's save_results_to_json function
+func (cp *ClusterProcessor) SaveResultsToJSON(outputFile string) error {
+	if outputFile == "" {
+		outputFile = "cluster_results.json"
+	}
+
+	// Convert keys back to original case for output
+	outputData := make(map[string][]HostData)
+	for clusterName, hosts := range cp.Data {
+		originalName := clusterName
+		for _, c := range cp.ClusterList {
+			if strings.ToLower(c) == clusterName {
+				originalName = c
+				break
+			}
+		}
+		outputData[originalName] = hosts
+	}
+
+	jsonData, err := json.MarshalIndent(outputData, "", "  ")
+	if err != nil {
+		return fmt.Errorf("error marshaling to JSON: %v", err)
+	}
+
+	err = os.WriteFile(outputFile, jsonData, 0644)
+	if err != nil {
+		return fmt.Errorf("error writing JSON file: %v", err)
+	}
+
+	log.Printf("Results saved to '%s'", outputFile)
+	return nil
+}
+
+// ExecuteCommandsOnCluster executes a command on all hosts in a specific cluster
+// Equivalent to Python's execute_commands_on_cluster function
+func (cp *ClusterProcessor) ExecuteCommandsOnCluster(clusterName, command, username string) (map[string]*Result, error) {
+	results := make(map[string]*Result)
+
+	// Find cluster (case insensitive)
+	var targetCluster []HostData
+	for clusterKey, hosts := range cp.Data {
+		if strings.EqualFold(clusterKey, clusterName) {
+			targetCluster = hosts
+			break
+		}
+	}
+
+	if targetCluster == nil {
+		return results, fmt.Errorf("cluster '%s' not found in processed data", clusterName)
+	}
+
+	log.Printf("Executing command on all hosts in cluster '%s':", clusterName)
+	log.Printf("Command: %s", command)
+	log.Printf("Number of hosts: %d", len(targetCluster))
+	log.Println(strings.Repeat("-", 50))
+
+	for _, host := range targetCluster {
+		hostname := host.HostName
+		log.Printf("[%s] Executing command...", hostname)
+
+		result, err := ExecOnRemoteHost(hostname, []string{command}, cp.SSHConfig)
+		if err != nil {
+			log.Printf("[%s] Failed: %v", hostname, err)
+			results[hostname] = &Result{
+				HostName: hostname,
+				Output:   "",
+				Error:    err,
+			}
+		} else {
+			results[hostname] = result
+		}
+	}
+
+	return results, nil
+}
+
+// CopyFilesFromCluster copies files from all hosts in a specific cluster
+// Equivalent to Python's copy_files_from_cluster function
+func (cp *ClusterProcessor) CopyFilesFromCluster(clusterName, sourceLocation, destinationBase, username string) (map[string]bool, error) {
+	results := make(map[string]bool)
+
+	// Find cluster (case insensitive)
+	var targetCluster []HostData
+	for clusterKey, hosts := range cp.Data {
+		if strings.EqualFold(clusterKey, clusterName) {
+			targetCluster = hosts
+			break
+		}
+	}
+
+	if targetCluster == nil {
+		return results, fmt.Errorf("cluster '%s' not found in processed data", clusterName)
+	}
+
+	log.Printf("Copying files from all hosts in cluster '%s':", clusterName)
+	log.Printf("Source: %s", sourceLocation)
+	log.Printf("Destination base: %s", destinationBase)
+	log.Printf("Number of hosts: %d", len(targetCluster))
+	log.Println(strings.Repeat("-", 50))
+
+	// Create base destination directory
+	err := os.MkdirAll(destinationBase, 0755)
+	if err != nil {
+		return results, fmt.Errorf("failed to create destination directory: %v", err)
+	}
+
+	for _, host := range targetCluster {
+		hostname := host.HostName
+		log.Printf("[%s] Copying file...", hostname)
+
+		// Create unique destination path for each host
+		filename := filepath.Base(sourceLocation)
+		destinationPath := filepath.Join(destinationBase, fmt.Sprintf("%s_%s", hostname, filename))
+
+		// Create SSH client for file copy
+		client, err := ssh.Dial("tcp", hostname+":22", cp.SSHConfig)
+		if err != nil {
+			log.Printf("[%s] Failed to connect: %v", hostname, err)
+			results[hostname] = false
+			continue
+		}
+
+		// Create SFTP client
+		sftpClient, err := sftp.NewClient(client)
+		if err != nil {
+			log.Printf("[%s] Failed to create SFTP client: %v", hostname, err)
+			client.Close()
+			results[hostname] = false
+			continue
+		}
+
+		// Open remote file
+		remoteFile, err := sftpClient.Open(sourceLocation)
+		if err != nil {
+			log.Printf("[%s] Failed to open remote file: %v", hostname, err)
+			sftpClient.Close()
+			client.Close()
+			results[hostname] = false
+			continue
+		}
+
+		// Create local file
+		localFile, err := os.Create(destinationPath)
+		if err != nil {
+			log.Printf("[%s] Failed to create local file: %v", hostname, err)
+			remoteFile.Close()
+			sftpClient.Close()
+			client.Close()
+			results[hostname] = false
+			continue
+		}
+
+		// Copy file contents
+		_, err = io.Copy(localFile, remoteFile)
+		if err != nil {
+			log.Printf("[%s] Failed to copy file: %v", hostname, err)
+			results[hostname] = false
+		} else {
+			log.Printf("[%s] File copied successfully", hostname)
+			results[hostname] = true
+		}
+
+		// Clean up
+		localFile.Close()
+		remoteFile.Close()
+		sftpClient.Close()
+		client.Close()
+	}
+
+	return results, nil
+}
+
+// ValidateCertificatesOnCluster checks certificate expiry on all hosts in a specific cluster
+// Equivalent to Python's validate_certificates_on_cluster function
+func (cp *ClusterProcessor) ValidateCertificatesOnCluster(clusterName, certPath, username string) (map[string]int, error) {
+	results := make(map[string]int)
+
+	// Find cluster (case insensitive)
+	var targetCluster []HostData
+	for clusterKey, hosts := range cp.Data {
+		if strings.EqualFold(clusterKey, clusterName) {
+			targetCluster = hosts
+			break
+		}
+	}
+
+	if targetCluster == nil {
+		return results, fmt.Errorf("cluster '%s' not found in processed data", clusterName)
+	}
+
+	log.Printf("Checking certificate expiry on all hosts in cluster '%s':", clusterName)
+	log.Printf("Certificate path: %s", certPath)
+	log.Printf("Number of hosts: %d", len(targetCluster))
+	log.Println(strings.Repeat("-", 50))
+
+	for _, host := range targetCluster {
+		hostname := host.HostName
+		log.Printf("[%s] Checking certificate...", hostname)
+
+		// Get certificate expiry information
+		daysToExpiry, err := getCertExpiryDays(hostname, certPath, cp.SSHConfig)
+		if err != nil {
+			log.Printf("[%s] Failed: %v", hostname, err)
+			results[hostname] = -9999
+		} else {
+			results[hostname] = daysToExpiry
+			if daysToExpiry >= 0 {
+				log.Printf("[%s] ✓ Certificate expires in %d days", hostname, daysToExpiry)
+			} else {
+				log.Printf("[%s] ✗ Certificate expired %d days ago", hostname, -daysToExpiry)
+			}
+		}
+	}
+
+	return results, nil
+}
+
+// GetHostnamesFromCluster returns a slice of hostnames for a given cluster
+func (cp *ClusterProcessor) GetHostnamesFromCluster(clusterName string) ([]string, error) {
+	var hostnames []string
+
+	// Find cluster (case insensitive)
+	var targetCluster []HostData
+	for clusterKey, hosts := range cp.Data {
+		if strings.EqualFold(clusterKey, clusterName) {
+			targetCluster = hosts
+			break
+		}
+	}
+
+	if targetCluster == nil {
+		return hostnames, fmt.Errorf("cluster '%s' not found in processed data", clusterName)
+	}
+
+	for _, host := range targetCluster {
+		hostnames = append(hostnames, host.HostName)
+	}
+
+	return hostnames, nil
+}
+
+// GetClusterNames returns a list of all cluster names that have data
+func (cp *ClusterProcessor) GetClusterNames() []string {
+	var clusterNames []string
+
+	for clusterName, hosts := range cp.Data {
+		if len(hosts) > 0 {
+			// Find original cluster name from ClusterList (preserve case)
+			originalName := clusterName
+			for _, c := range cp.ClusterList {
+				if strings.ToLower(c) == clusterName {
+					originalName = c
+					break
+				}
+			}
+			clusterNames = append(clusterNames, originalName)
+		}
+	}
+
+	return clusterNames
 }
